@@ -27,6 +27,13 @@
     "render.html2png"
   ],
   "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.png",
+      "background": "#3B82F6"
+    }
+  },
   "i18n": {
     "default_locale": "zh-CN"
   }

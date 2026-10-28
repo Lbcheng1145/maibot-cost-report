@@ -2,6 +2,10 @@
 config.toml
 config_back/
 
+# 只保留图标
+assets/*
+!assets/icon.png
+
 # Python
 __pycache__/
 *.py[cod]
