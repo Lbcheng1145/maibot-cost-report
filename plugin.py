@@ -215,16 +215,10 @@ class CostReportPlugin(MaiBotPlugin):
 
     @Tool(
         "check_cost",
-        brief_description=(
-            "查麦麦自己烧了多少钱：有人问花了多少、成本多少、token 用了多少、"
-            "哪个模型最贵时调用"
-        ),
+        brief_description="查麦麦自己的 token 花费：有人问花了多少、成本多少时调用",
         detailed_description=(
-            "查的是麦麦运行时真实的模型开销，数据来自本机统计表，不是估算。"
-            "返回总花费、token 数、调用次数、缓存命中率，以及花钱最多的几个模型。"
-            "用户问「今天花了多少钱」「这个月开销多少」「哪个模型最贵」时调用。"
-            "拿到数字后用你自己的话一两句说完，不要照着念，也不要加表格。"
-            "只有对方真的在问开销时才调，别主动提这个话题。"
+            "返回总花费、token、调用次数、缓存命中率和几个主要模型。"
+            "拿到数字用自己的话一两句说完，别念表格，也别主动提这个话题。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -236,7 +230,7 @@ class CostReportPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="days",
                 param_type=ToolParamType.INTEGER,
-                description="统计最近几天，1 就是最近 24 小时。不填默认 1",
+                description="最近几天，不填默认 1（即 24 小时）",
                 required=False,
             ),
         ],
