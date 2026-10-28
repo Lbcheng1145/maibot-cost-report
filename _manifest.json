@@ -1,0 +1,33 @@
+{
+  "manifest_version": 2,
+  "id": "com.lbcheng1145.cost-report",
+  "version": "1.0.0",
+  "name": "开销统计",
+  "description": "查询麦麦的 token 消耗和模型花费，默认看最近 24 小时。支持命令和 LLM 工具调用。",
+  "author": {
+    "name": "Lbcheng1145",
+    "url": "https://github.com/Lbcheng1145"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Lbcheng1145/maibot-cost-report"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.16.99"
+  },
+  "capabilities": [
+    "statistics.local.models",
+    "send.text",
+    "send.image",
+    "render.html2png"
+  ],
+  "plugin_type": "extension",
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}

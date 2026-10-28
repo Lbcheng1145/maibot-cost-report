@@ -1,0 +1,14 @@
+# 运行期生成，含本机路径，不要提交
+config.toml
+config_back/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
