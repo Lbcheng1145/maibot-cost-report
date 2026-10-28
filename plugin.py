@@ -285,16 +285,17 @@ class CostReportPlugin(MaiBotPlugin):
         injected = str(kwargs.get("stream_id") or "").strip()
         resolved = await self._lookup_stream(kwargs)
 
-        if injected and resolved:
-            if injected != resolved:
+        # 以反查结果为准：私聊场景下宿主注入的 stream_id 可能就是账号号
+        # （实测发出去会报「未找到聊天流: 1954301279」），反查拿到的才是真实流。
+        if resolved:
+            if injected and injected != resolved:
                 self.ctx.logger.warning(
-                    "stream_id(%s…) 与 chat_id 反查结果(%s…) 不一致，疑似被篡改",
+                    "注入的 stream_id(%s…) 与反查(%s…) 不一致，以反查为准",
                     injected[:8],
                     resolved[:8],
                 )
-                return ""
-            return injected
-        return injected or resolved
+            return resolved
+        return injected
 
     # ---------------------------------------------------------------- 工具
 
