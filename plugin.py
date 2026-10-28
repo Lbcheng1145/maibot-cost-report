@@ -303,6 +303,14 @@ class CostReportPlugin(MaiBotPlugin):
                     resolved[:8],
                 )
             return resolved
+
+        # 兜底：chat_id 在 QQ 私聊里直接就是流 ID（实测 4d12676e…），
+        # 而 stream_id 反而是机器人账号号（1954301279，纯数字）。
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        if chat_id and not chat_id.isdigit():
+            self.ctx.logger.debug("反查全失败，改用 chat_id 当流 ID: %r", chat_id)
+            return chat_id
+
         return injected
 
     # ---------------------------------------------------------------- 工具
