@@ -163,6 +163,23 @@ class ReportConfig(PluginConfigBase):
         },
     )
 
+    db_path: str = Field(
+        default="",
+        description="宿主数据库文件路径，仅缓存命中率用",
+        json_schema_extra={
+            "label": "数据库路径（可选）",
+            "hint": (
+                "留空则按「插件数据目录往上两级」去猜宿主根目录下的 MaiBot.db。"
+                "这个推算依赖宿主的目录结构，宿主换布局就会失效；"
+                "猜不到或结构变了，把完整路径填在这里。"
+                "只在「显示缓存命中率」开启时才会读这个文件。"
+            ),
+            "placeholder": "C:/.../MaiBot/data/MaiBot.db",
+            "depends_on": "show_cache",
+            "order": 9,
+        },
+    )
+
 
 class RootConfig(PluginConfigBase):
     """配置根模型。⚠ `plugin` 节必须显式声明，否则加载失败。"""
@@ -201,10 +218,29 @@ class CostReportPlugin(MaiBotPlugin):
         调用方据此决定是报错还是说「还没有记录」。
         """
         try:
-            models = await self.ctx.statistics.local.models(days=days, limit=20)
+            raw = await self.ctx.statistics.local.models(days=days, limit=20)
         except Exception as exc:
             self.ctx.logger.error("查询模型统计失败: %s", exc)
             return None, {}
+
+        # ⚠ 宿主查询失败时返回的是 {"success": False, "error": ...}，不会抛异常；
+        # SDK 的 _normalize_capability_result 只在有 models 键时才解包，
+        # 所以软失败拿到的是整个 dict，直接 for m in models 会去遍历键名。
+        if isinstance(raw, dict):
+            inner = raw.get("models")
+            if inner is None:
+                self.ctx.logger.warning(
+                    "统计查询软失败: %s", raw.get("error") or raw
+                )
+                return None, {}
+            raw = inner
+        if not isinstance(raw, list):
+            self.ctx.logger.warning(
+                "统计查询返回了意外类型 %s，按失败处理", type(raw).__name__
+            )
+            return None, {}
+
+        models = [m for m in raw if isinstance(m, dict)]
 
         cache_stats: dict[str, dict[str, int]] = {}
         if self.config.report.show_cache:
@@ -358,11 +394,14 @@ class CostReportPlugin(MaiBotPlugin):
         hit_rate = (hit_sum / denom * 100) if denom else 0.0
 
         def esc(value: Any) -> str:
+            # 引号也要转义：模型名会被塞进 title="{name}" 属性里
             return (
                 str(value)
                 .replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&#39;")
             )
 
         ranked = sorted(models, key=lambda m: -float(m.get("total_cost") or 0))[: cfg.top_models]
@@ -406,6 +445,15 @@ class CostReportPlugin(MaiBotPlugin):
               <div class="k">缓存命中</div>
               <div class="v">{hit_rate:.1f}<small>%</small></div>
               <div class="d">{hit_sum:,} 命中 / {miss_sum:,} 未命中</div>
+            </div>
+            """
+        elif cfg.show_cache:
+            # 开了命中率却拿不到数据时，明说一句，别让用户对着空白猜。
+            cache_block = """
+            <div class="stat">
+              <div class="k">缓存命中</div>
+              <div class="v muted">—</div>
+              <div class="d">读不到 llm_usage，检查「数据库路径」配置</div>
             </div>
             """
 
@@ -486,7 +534,15 @@ class CostReportPlugin(MaiBotPlugin):
     # ---------------------------------------------------------------- 缓存统计
 
     def _db_path(self) -> Path | None:
-        """插件数据目录在 `<root>/data/plugins/<id>`，往上两级就是数据库所在目录。"""
+        """宿主数据库文件路径。
+
+        优先用配置里的 `report.db_path`；留空才按「插件数据目录往上两级」去猜。
+        猜路径押在宿主的目录布局上（`data/plugins/<id>` → `data/MaiBot.db`），
+        宿主一改布局就会失效，所以留了手填的口子。
+        """
+        override = str(self.config.report.db_path or "").strip()
+        if override:
+            return Path(override)
         try:
             return Path(self.ctx.paths.data_dir).parent.parent / "MaiBot.db"
         except Exception:
@@ -496,7 +552,10 @@ class CostReportPlugin(MaiBotPlugin):
         """从 `llm_usage` 明细表算缓存命中。聚合表没有缓存字段，只能查明细。"""
         db_path = self._db_path()
         if db_path is None or not db_path.is_file():
-            self.ctx.logger.debug("数据库文件不存在，跳过缓存统计: %s", db_path)
+            # 用 warning 而不是 debug：这会让卡片上的命中率变成「—」，得能在日志里看到原因
+            self.ctx.logger.warning(
+                "数据库文件不存在，缓存命中率不可用: %s（可在「数据库路径」里手填）", db_path
+            )
             return {}
 
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")

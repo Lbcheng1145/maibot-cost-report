@@ -30,6 +30,7 @@
 | `report.title` | `麦麦开销` | 卡片图标题，留空则只显示时间范围 |
 | `report.tool_enabled` | `true` | 是否给 LLM 提供查询工具 |
 | `report.tool_send_image` | `false` | 工具调用时是否同时发图 |
+| `report.db_path` | 空 | 宿主数据库路径，仅缓存命中率用。留空按「插件数据目录往上两级」推算 |
 
 ## 命令
 
@@ -49,9 +50,15 @@
 
 聚合表里没有缓存字段，命中率只能从 `llm_usage` 明细算。插件会用**只读模式**（`mode=ro`）打开宿主数据库，只执行一条 `SELECT ... GROUP BY`，不写入、不改结构。
 
-如果不想让插件碰数据库，把 `report.show_cache` 关掉即可，此时只走官方能力，不读文件。
+需要说明的是，这条路径**在宿主的能力体系之外**——宿主没有「读数据库文件」这种能力，`database.query` 只支持按模型类做等值查询，没有聚合也没有 SQL 直通，所以只能自己开文件。它依赖三个宿主没有承诺过的内部细节：
 
-为什么不用 `database.query` 能力：它按模型名做等值查询，做不了 `GROUP BY` + `SUM`，拉全表到内存再聚合在 24 小时几万条的规模下不可行。
+1. 数据库文件名是 `MaiBot.db`
+2. 它位于「插件数据目录往上两级」（`data/plugins/<id>` → `data/MaiBot.db`）
+3. `llm_usage` 表里有 `model_assign_name`、`prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、`timestamp` 这四列
+
+宿主一旦调整目录布局或表结构，这个功能会失效。失效时的表现是卡片上「缓存命中」显示 `—` 并在下面提示检查「数据库路径」，日志里也会有一条 `warning`，不会静默。如果路径推算不对，把 `report.db_path` 填成实际的 `MaiBot.db` 绝对路径即可。
+
+如果不想让插件碰数据库，把 `report.show_cache` 关掉即可，此时只走官方能力，完全不读文件。
 
 ## 常见问题
 
@@ -59,7 +66,7 @@
 模型名取的是 `llm_usage.model_assign_name`（配置里的模型名），不是 `model_identifier`。两者不同名时以配置名为准。
 
 **缓存命中率显示「—」？**
-该模型在统计窗口内没有缓存字段数据，或者数据库读不到。检查 `show_cache` 是否开启、数据库是否被其他进程长时间锁住。
+卡片上会同时提示「读不到 llm_usage，检查数据库路径」。先看日志里那条 `数据库文件不存在` 的 warning，路径不对就把 `report.db_path` 填成 `MaiBot.db` 的绝对路径；路径对但还是「—」，可能是该窗口内没有缓存字段数据，或者数据库被别的进程长时间锁住。
 
 **渲染失败？**
 会自动退回纯文本，日志里会有一条「统计图渲染失败」。常见原因是 Playwright 浏览器没装好。
