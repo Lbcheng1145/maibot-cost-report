@@ -150,13 +150,13 @@ class ReportConfig(PluginConfigBase):
     )
 
     tool_send_image: bool = Field(
-        default=False,
+        default=True,
         description="工具调用时是否同时发统计图",
         json_schema_extra={
             "label": "工具调用也发图",
             "hint": (
-                "默认关闭：工具只把数字交给 LLM，由它转述，回复更自然。"
-                "开启后每次调用会额外发一张卡片图，但 LLM 通常还会再说一遍，容易重复。"
+                "开启后 LLM 查开销时会顺手发一张卡片图，比纯文字直观。"
+                "关掉则只把数字交给 LLM 由它转述，回复更短，但看不到图和分模型明细。"
             ),
             "depends_on": "tool_enabled",
             "order": 8,
@@ -247,6 +247,55 @@ class CostReportPlugin(MaiBotPlugin):
             cache_stats = await asyncio.to_thread(self._query_cache_stats, days)
         return models, cache_stats
 
+    async def _lookup_stream(self, kwargs: dict) -> str:
+        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。"""
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        user_id = str(kwargs.get("user_id") or "").strip()
+        try:
+            session = None
+            if chat_id:
+                if user_id and chat_id == user_id:
+                    session = await self.ctx.chat.get_stream_by_user_id(user_id)
+                else:
+                    session = await self.ctx.chat.get_stream_by_group_id(chat_id)
+            elif user_id:
+                session = await self.ctx.chat.get_stream_by_user_id(user_id)
+
+            if isinstance(session, dict):
+                return str(
+                    session.get("stream_id") or session.get("session_id") or ""
+                ).strip()
+        except Exception as exc:
+            self.ctx.logger.warning("按 chat_id 反查聊天流失败: %s", exc)
+        return ""
+
+    async def _resolve_stream(self, kwargs: dict) -> str:
+        """决定把卡片图发到哪个流。拿不到可信来源就返回空串。
+
+        工具路径的载荷不可信：宿主构造 payload 时先把模型传的参数原样放进去、
+        仅当键缺失或为空才补上下文，所以模型多带一个 stream_id 就能压过注入值。
+        这里让 `stream_id` 和 `chat_id` 反查结果互证，对不上就不发。
+        """
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            sid = str(message.get("session_id") or "").strip()
+            if sid:
+                return sid
+
+        injected = str(kwargs.get("stream_id") or "").strip()
+        resolved = await self._lookup_stream(kwargs)
+
+        if injected and resolved:
+            if injected != resolved:
+                self.ctx.logger.warning(
+                    "stream_id(%s…) 与 chat_id 反查结果(%s…) 不一致，疑似被篡改",
+                    injected[:8],
+                    resolved[:8],
+                )
+                return ""
+            return injected
+        return injected or resolved
+
     # ---------------------------------------------------------------- 工具
 
     @Tool(
@@ -258,12 +307,6 @@ class CostReportPlugin(MaiBotPlugin):
         ),
         parameters=[
             ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID",
-                required=True,
-            ),
-            ToolParameterInfo(
                 name="days",
                 param_type=ToolParamType.INTEGER,
                 description="最近几天，不填默认 1（即 24 小时）",
@@ -271,7 +314,7 @@ class CostReportPlugin(MaiBotPlugin):
             ),
         ],
     )
-    async def handle_check_cost(self, stream_id: str = "", days: int = 0, **kwargs):
+    async def handle_check_cost(self, days: int = 0, **kwargs):
         cfg = self.config.report
         if not self.config.plugin.enabled or not cfg.enabled or not cfg.tool_enabled:
             return {"success": False, "content": "开销统计没开，查不了。"}
@@ -291,8 +334,13 @@ class CostReportPlugin(MaiBotPlugin):
 
         content = self._summarize(models, span, cache_stats)
 
-        if cfg.tool_send_image and stream_id and models:
-            await self._send_image(models, span, cache_stats, stream_id)
+        if cfg.tool_send_image and models:
+            # 不采信模型填的 stream_id：宿主的工具 payload 会被模型参数压过
+            stream_id = await self._resolve_stream(kwargs)
+            if stream_id:
+                await self._send_image(models, span, cache_stats, stream_id)
+            else:
+                self.ctx.logger.warning("拿不到可信的聊天流，本次只回文字不配图")
 
         return {"success": True, "content": content}
 

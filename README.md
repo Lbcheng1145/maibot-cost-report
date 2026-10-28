@@ -29,7 +29,7 @@
 | `report.output_mode` | `image` | `text` / `image` / `both`，渲染失败会自动退回文本 |
 | `report.title` | `麦麦开销` | 卡片图标题，留空则只显示时间范围 |
 | `report.tool_enabled` | `true` | 是否给 LLM 提供查询工具 |
-| `report.tool_send_image` | `false` | 工具调用时是否同时发图 |
+| `report.tool_send_image` | `true` | 工具调用时是否同时发图 |
 | `report.db_path` | 空 | 宿主数据库路径，仅缓存命中率用。留空按「插件数据目录往上两级」推算 |
 
 ## 命令
