@@ -251,22 +251,30 @@ class CostReportPlugin(MaiBotPlugin):
         """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。"""
         chat_id = str(kwargs.get("chat_id") or "").strip()
         user_id = str(kwargs.get("user_id") or "").strip()
-        try:
-            session = None
-            if chat_id:
-                if user_id and chat_id == user_id:
-                    session = await self.ctx.chat.get_stream_by_user_id(user_id)
-                else:
-                    session = await self.ctx.chat.get_stream_by_group_id(chat_id)
-            elif user_id:
-                session = await self.ctx.chat.get_stream_by_user_id(user_id)
-
+        # 私聊时 chat_id 可能是机器人自己的账号号（实测 1954301279），不等于对方 QQ，
+        # 拿它查群必然失败。所以按「先群后私聊」试：群聊命中就返回，
+        # 查不到再拿 user_id 查私聊流。
+        for fetch, arg, label in (
+            (self.ctx.chat.get_stream_by_group_id, chat_id, "群"),
+            (self.ctx.chat.get_stream_by_user_id, user_id, "私聊"),
+        ):
+            if not arg:
+                continue
+            try:
+                session = await fetch(arg)
+            except Exception as exc:
+                self.ctx.logger.warning("按%s反查聊天流失败(%s): %s", label, arg, exc)
+                continue
+            sid = ""
             if isinstance(session, dict):
-                return str(
+                sid = str(
                     session.get("stream_id") or session.get("session_id") or ""
                 ).strip()
-        except Exception as exc:
-            self.ctx.logger.warning("按 chat_id 反查聊天流失败: %s", exc)
+            self.ctx.logger.debug(
+                "反查流 %s=%r -> %r（chat_id=%r user_id=%r）", label, arg, sid, chat_id, user_id
+            )
+            if sid:
+                return sid
         return ""
 
     async def _resolve_stream(self, kwargs: dict) -> str:
