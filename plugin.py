@@ -247,42 +247,53 @@ class CostReportPlugin(MaiBotPlugin):
             cache_stats = await asyncio.to_thread(self._query_cache_stats, days)
         return models, cache_stats
 
+    async def _fetch_stream(self, fetch, arg: str, label: str) -> str:
+        """调一次反查，拿回 stream_id。查不到或出错返回空串。"""
+        if not arg:
+            return ""
+        try:
+            session = await fetch(arg)
+        except Exception as exc:
+            self.ctx.logger.warning("按%s反查聊天流失败(%s): %s", label, arg, exc)
+            return ""
+        sid = ""
+        if isinstance(session, dict):
+            sid = str(session.get("stream_id") or session.get("session_id") or "").strip()
+        self.ctx.logger.debug("反查流 %s=%r -> %r", label, arg, sid)
+        return sid
+
     async def _lookup_stream(self, kwargs: dict) -> str:
-        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。"""
+        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。
+
+        ⚠ 群聊里 `user_id` 是**发言人**，拿它查会查到那个人的私聊流，
+        把本该发到群里的图发到私聊去。所以纯数字的 chat_id（群号）只按群查，
+        绝不退回 user_id。
+        """
         chat_id = str(kwargs.get("chat_id") or "").strip()
         user_id = str(kwargs.get("user_id") or "").strip()
-        # 私聊时 chat_id 可能是机器人自己的账号号（实测 1954301279），不等于对方 QQ，
-        # 拿它查群必然失败。所以按「先群后私聊」试：群聊命中就返回，
-        # 查不到再拿 user_id 查私聊流。
-        for fetch, arg, label in (
-            (self.ctx.chat.get_stream_by_group_id, chat_id, "群"),
-            (self.ctx.chat.get_stream_by_user_id, user_id, "私聊"),
-        ):
-            if not arg:
-                continue
-            try:
-                session = await fetch(arg)
-            except Exception as exc:
-                self.ctx.logger.warning("按%s反查聊天流失败(%s): %s", label, arg, exc)
-                continue
-            sid = ""
-            if isinstance(session, dict):
-                sid = str(
-                    session.get("stream_id") or session.get("session_id") or ""
-                ).strip()
-            self.ctx.logger.debug(
-                "反查流 %s=%r -> %r（chat_id=%r user_id=%r）", label, arg, sid, chat_id, user_id
+
+        if chat_id.isdigit():
+            return await self._fetch_stream(
+                self.ctx.chat.get_stream_by_group_id, chat_id, "群"
             )
-            if sid:
-                return sid
-        return ""
+
+        # 非数字：私聊或内部会话。先按群试（有些平台的 chat_id 直接就是流 ID），
+        # 查不到再按 user_id 查私聊流。
+        sid = await self._fetch_stream(
+            self.ctx.chat.get_stream_by_group_id, chat_id, "群"
+        )
+        if sid:
+            return sid
+        return await self._fetch_stream(
+            self.ctx.chat.get_stream_by_user_id, user_id, "私聊"
+        )
 
     async def _resolve_stream(self, kwargs: dict) -> str:
-        """决定把卡片图发到哪个流。拿不到可信来源就返回空串。
+        """决定把卡片图发到哪个流。
 
-        工具路径的载荷不可信：宿主构造 payload 时先把模型传的参数原样放进去、
-        仅当键缺失或为空才补上下文，所以模型多带一个 stream_id 就能压过注入值。
-        这里让 `stream_id` 和 `chat_id` 反查结果互证，对不上就不发。
+        宿主构造工具 payload 时先把模型传的参数原样放进去、仅当键缺失才补上下文，
+        所以 `stream_id` 可能是模型塞的，也可能只是机器人的账号号（私聊实测如此）。
+        因此以 `chat_id` / `user_id` 反查出来的流为准，反查全失败才退回注入值。
         """
         message = kwargs.get("message")
         if isinstance(message, dict):
@@ -293,8 +304,6 @@ class CostReportPlugin(MaiBotPlugin):
         injected = str(kwargs.get("stream_id") or "").strip()
         resolved = await self._lookup_stream(kwargs)
 
-        # 以反查结果为准：私聊场景下宿主注入的 stream_id 可能就是账号号
-        # （实测发出去会报「未找到聊天流: 1954301279」），反查拿到的才是真实流。
         if resolved:
             if injected and injected != resolved:
                 self.ctx.logger.warning(
@@ -305,7 +314,7 @@ class CostReportPlugin(MaiBotPlugin):
             return resolved
 
         # 兜底：chat_id 在 QQ 私聊里直接就是流 ID（实测 4d12676e…），
-        # 而 stream_id 反而是机器人账号号（1954301279，纯数字）。
+        # 而 stream_id 反而是机器人账号号（纯数字）。
         chat_id = str(kwargs.get("chat_id") or "").strip()
         if chat_id and not chat_id.isdigit():
             self.ctx.logger.debug("反查全失败，改用 chat_id 当流 ID: %r", chat_id)
