@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -209,6 +210,41 @@ class CostReportPlugin(MaiBotPlugin):
             return 1
         return min(days, self.config.report.max_days)
 
+    @staticmethod
+    def _num(value: Any) -> float:
+        """把宿主返回的数值字段转成 float，坏值按 0 算。
+
+        宿主保证给数字，但数据库里被手工改过的行、或者宿主将来换字段类型时，
+        一个坏值会让整张统计图崩掉，不值得。
+        """
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _totals(self, models: list[dict[str, Any]]) -> tuple[float, int, int]:
+        """(总花费, 总 token, 总调用次数)。
+
+        三处格式化都从这里取，避免哪天改了一处、另外两处的口径悄悄漂开。
+        """
+        cost = sum(self._num(m.get("total_cost")) for m in models)
+        tokens = sum(int(self._num(m.get("total_tokens"))) for m in models)
+        req = sum(int(self._num(m.get("request_count"))) for m in models)
+        return cost, tokens, req
+
+    @staticmethod
+    def _hit_miss(cache_stats: dict[str, dict[str, int]]) -> tuple[int, int]:
+        """(缓存命中 token, 未命中 token)。"""
+        hit = sum(int(v.get("hit") or 0) for v in cache_stats.values())
+        miss = sum(int(v.get("miss") or 0) for v in cache_stats.values())
+        return hit, miss
+
+    @staticmethod
+    def _pad(text: str, width: int) -> str:
+        """按显示宽度补空格：中文占两格，直接用 format 的 :<N 会对不齐。"""
+        shown = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+        return text + " " * max(0, width - shown)
+
     async def _gather(
         self, days: int
     ) -> tuple[list[dict[str, Any]] | None, dict[str, dict[str, int]]]:
@@ -218,20 +254,31 @@ class CostReportPlugin(MaiBotPlugin):
         调用方据此决定是报错还是说「还没有记录」。
         """
         try:
-            raw = await self.ctx.statistics.local.models(days=days, limit=20)
+            # 宿主按 request_count 降序取前 N 个（上限 50），不是按花费。
+            # 取满 50 是为了尽量别漏掉「调用少但单价贵」的模型，
+            # 否则卡片上的总花费会偏低。真超过 50 个时 footer 会注明。
+            #
+            # ⚠ 这里走 call_capability 而不是 ctx.statistics.local.models()：
+            # 后者的封装会把「查询失败」也归一成空列表（SDK statistics.py:20-29），
+            # 于是数据库被锁时用户看到的是「还没有模型调用记录」，查不出真原因。
+            raw = await self.ctx.call_capability(
+                "statistics.local.models", days=days, limit=50
+            )
         except Exception as exc:
             self.ctx.logger.error("查询模型统计失败: %s", exc)
             return None, {}
 
-        # ⚠ 宿主查询失败时返回的是 {"success": False, "error": ...}，不会抛异常；
-        # SDK 的 _normalize_capability_result 只在有 models 键时才解包，
-        # 所以软失败拿到的是整个 dict，直接 for m in models 会去遍历键名。
+        # 宿主查询失败时返回 {"success": False, "error": ...}，不会抛异常
         if isinstance(raw, dict):
-            inner = raw.get("models")
-            if inner is None:
+            if not raw.get("success", True):
+                # 只打前 200 字：软失败里可能带 SQL 和表名，整段进日志没必要
                 self.ctx.logger.warning(
-                    "统计查询软失败: %s", raw.get("error") or raw
+                    "统计查询失败: %s", str(raw.get("error") or raw)[:200]
                 )
+                return None, {}
+            inner = raw.get("models")
+            if not isinstance(inner, list):
+                self.ctx.logger.warning("统计查询没有返回 models 列表，按失败处理")
                 return None, {}
             raw = inner
         if not isinstance(raw, list):
@@ -247,80 +294,39 @@ class CostReportPlugin(MaiBotPlugin):
             cache_stats = await asyncio.to_thread(self._query_cache_stats, days)
         return models, cache_stats
 
-    async def _fetch_stream(self, fetch, arg: str, label: str) -> str:
-        """调一次反查，拿回 stream_id。查不到或出错返回空串。"""
-        if not arg:
-            return ""
-        try:
-            session = await fetch(arg)
-        except Exception as exc:
-            self.ctx.logger.warning("按%s反查聊天流失败(%s): %s", label, arg, exc)
-            return ""
-        sid = ""
-        if isinstance(session, dict):
-            sid = str(session.get("stream_id") or session.get("session_id") or "").strip()
-        self.ctx.logger.debug("反查流 %s=%r -> %r", label, arg, sid)
-        return sid
+    @staticmethod
+    def _resolve_stream(kwargs: dict) -> str:
+        """工具路径的当前会话流 ID。
 
-    async def _lookup_stream(self, kwargs: dict) -> str:
-        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。
+        `component_query._build_tool_context_payload`（宿主 747-750 行）把
+        `stream_id` 和 `chat_id` 都设成 `context.stream_id or context.session_id`，
+        两者同源，就是当前会话的 session_id，可以直接拿去发消息。
 
-        ⚠ 群聊里 `user_id` 是**发言人**，拿它查会查到那个人的私聊流，
-        把本该发到群里的图发到私聊去。所以纯数字的 chat_id（群号）只按群查，
-        绝不退回 user_id。
+        ⚠ 绝不能拿 `chat_id` 去 `get_stream_by_group_id` 反查：群聊里它是一串
+        32 位 session_id 而不是群号，反查必然失败；失败后再退回
+        `get_stream_by_user_id`（那里面是发言人）就会把图发到发言人的私聊去。
+        真实群号在 `group_id` 里，但那个键模型也能塞，所以干脆不做任何反查。
         """
-        chat_id = str(kwargs.get("chat_id") or "").strip()
-        user_id = str(kwargs.get("user_id") or "").strip()
+        for key in ("stream_id", "chat_id"):
+            value = str(kwargs.get(key) or "").strip()
+            if value:
+                return value
+        return ""
 
-        if chat_id.isdigit():
-            return await self._fetch_stream(
-                self.ctx.chat.get_stream_by_group_id, chat_id, "群"
-            )
+    @staticmethod
+    def _command_stream(kwargs: dict) -> str:
+        """命令路径的当前会话 ID。
 
-        # 非数字：私聊或内部会话。先按群试（有些平台的 chat_id 直接就是流 ID），
-        # 查不到再按 user_id 查私聊流。
-        sid = await self._fetch_stream(
-            self.ctx.chat.get_stream_by_group_id, chat_id, "群"
-        )
-        if sid:
-            return sid
-        return await self._fetch_stream(
-            self.ctx.chat.get_stream_by_user_id, user_id, "私聊"
-        )
-
-    async def _resolve_stream(self, kwargs: dict) -> str:
-        """决定把卡片图发到哪个流。
-
-        宿主构造工具 payload 时先把模型传的参数原样放进去、仅当键缺失才补上下文，
-        所以 `stream_id` 可能是模型塞的，也可能只是机器人的账号号（私聊实测如此）。
-        因此以 `chat_id` / `user_id` 反查出来的流为准，反查全失败才退回注入值。
+        命令的 kwargs 由宿主构造、模型不参与，所以 `message.session_id` 可信；
+        而 `stream_id` 在私聊里可能是机器人账号号，拿它发会报「未找到聊天流」。
+        先取 session_id，取不到再退回 stream_id。
         """
         message = kwargs.get("message")
         if isinstance(message, dict):
             sid = str(message.get("session_id") or "").strip()
             if sid:
                 return sid
-
-        injected = str(kwargs.get("stream_id") or "").strip()
-        resolved = await self._lookup_stream(kwargs)
-
-        if resolved:
-            if injected and injected != resolved:
-                self.ctx.logger.warning(
-                    "注入的 stream_id(%s…) 与反查(%s…) 不一致，以反查为准",
-                    injected[:8],
-                    resolved[:8],
-                )
-            return resolved
-
-        # 兜底：chat_id 在 QQ 私聊里直接就是流 ID（实测 4d12676e…），
-        # 而 stream_id 反而是机器人账号号（纯数字）。
-        chat_id = str(kwargs.get("chat_id") or "").strip()
-        if chat_id and not chat_id.isdigit():
-            self.ctx.logger.debug("反查全失败，改用 chat_id 当流 ID: %r", chat_id)
-            return chat_id
-
-        return injected
+        return str(kwargs.get("stream_id") or "").strip()
 
     # ---------------------------------------------------------------- 工具
 
@@ -361,18 +367,17 @@ class CostReportPlugin(MaiBotPlugin):
         content = self._summarize(models, span, cache_stats)
 
         if cfg.tool_send_image and models:
-            # 不采信模型填的 stream_id：宿主的工具 payload 会被模型参数压过
-            stream_id = await self._resolve_stream(kwargs)
+            stream_id = self._resolve_stream(kwargs)
             if stream_id:
                 await self._send_image(models, span, cache_stats, stream_id)
             else:
-                self.ctx.logger.warning("拿不到可信的聊天流，本次只回文字不配图")
+                self.ctx.logger.warning("拿不到当前聊天流，本次只回文字不配图")
 
         return {"success": True, "content": content}
 
     # ---------------------------------------------------------------- 命令
 
-    @Command("cost", pattern=r"^/(开销|成本|花费|cost)(?:\s+(?P<days>\d{1,3}))?$")
+    @Command("cost", pattern=r"^/(开销|成本|花费|cost)\s*(?P<days>\d{1,3})?\s*(?:天)?$")
     async def handle_cost(self, **kwargs):
         cfg = self.config.report
         if not self.config.plugin.enabled or not cfg.enabled:
@@ -387,7 +392,7 @@ class CostReportPlugin(MaiBotPlugin):
             return False, "查询失败，看看日志。", 1
 
         text = self._format(models, days, cache_stats)
-        stream_id = str(kwargs.get("stream_id") or "")
+        stream_id = self._command_stream(kwargs)
         mode = str(cfg.output_mode or "image").strip().lower()
 
         # ⚠ 命令的返回值不会自动发到聊天流（bot.py:665 只存库记日志），必须自己发。
@@ -414,18 +419,24 @@ class CostReportPlugin(MaiBotPlugin):
         stream_id: str,
     ) -> bool:
         """把统计渲染成卡片图发出去。失败返回 False，由调用方退回文本。"""
-        html = self._build_html(models, days, cache_stats)
+        # Playwright 单实例不吃并发渲染：两次调用同时进来会互相排队甚至超时。
+        # 用实例级锁把渲染串起来，锁只护渲染这一段，发图不受影响。
+        lock = getattr(self, "_render_lock", None)
+        if lock is None:
+            lock = self._render_lock = asyncio.Lock()
         try:
+            html = self._build_html(models, days, cache_stats)
             # 只截 .card 本体：用 body + full_page 会把整页视口都截进去，
             # 底部留一大片空白（视口 720 高、内容只有 600）。
-            result = await self.ctx.render.html2png(
-                html,
-                selector=".card",
-                viewport={"width": 760, "height": 400},
-                device_scale_factor=2.0,
-                full_page=False,
-                allow_network=False,
-            )
+            async with lock:
+                result = await self.ctx.render.html2png(
+                    html,
+                    selector=".card",
+                    viewport={"width": 760, "height": 400},
+                    device_scale_factor=2.0,
+                    full_page=False,
+                    allow_network=False,
+                )
         except Exception as exc:
             self.ctx.logger.warning("统计图渲染失败: %s", exc)
             return False
@@ -437,12 +448,18 @@ class CostReportPlugin(MaiBotPlugin):
             self.ctx.logger.warning("统计图渲染没有返回 image_base64")
             return False
 
+        # ⚠ send.image 失败时**不抛异常**，而是返回 False（SDK 把它列进
+        # _BOOLEAN_SUCCESS_CAPABILITIES）。不接返回值就会把「没发出去」当成功，
+        # 命令路径据此跳过补发文本，用户最后一条回复都收不到。
         try:
-            await self.ctx.send.image(b64, stream_id)
-            return True
+            ok = await self.ctx.send.image(b64, stream_id)
         except Exception as exc:
             self.ctx.logger.warning("发送统计图失败: %s", exc)
             return False
+        if not ok:
+            self.ctx.logger.warning("统计图没发出去，宿主返回失败")
+            return False
+        return True
 
     def _build_html(
         self,
@@ -457,13 +474,10 @@ class CostReportPlugin(MaiBotPlugin):
         custom_title = str(cfg.title or "").strip()
         heading = f"{custom_title} · {label}" if custom_title else label
 
-        total_cost = sum(float(m.get("total_cost") or 0) for m in models)
-        total_tokens = sum(int(m.get("total_tokens") or 0) for m in models)
-        total_req = sum(int(m.get("request_count") or 0) for m in models)
+        total_cost, total_tokens, total_req = self._totals(models)
         avg_per_k = (total_cost / total_req * 1000) if total_req else 0.0
 
-        hit_sum = sum(v["hit"] for v in cache_stats.values())
-        miss_sum = sum(v["miss"] for v in cache_stats.values())
+        hit_sum, miss_sum = self._hit_miss(cache_stats)
         denom = hit_sum + miss_sum
         hit_rate = (hit_sum / denom * 100) if denom else 0.0
 
@@ -478,14 +492,14 @@ class CostReportPlugin(MaiBotPlugin):
                 .replace("'", "&#39;")
             )
 
-        ranked = sorted(models, key=lambda m: -float(m.get("total_cost") or 0))[: cfg.top_models]
+        ranked = sorted(models, key=lambda m: -self._num(m.get("total_cost")))[: cfg.top_models]
         rows: list[str] = []
-        max_cost = float(ranked[0].get("total_cost") or 0) if ranked else 0.0
+        max_cost = self._num(ranked[0].get("total_cost")) if ranked else 0.0
         for m in ranked:
             name = esc(str(m.get("model_name") or "Unknown"))
-            cost = float(m.get("total_cost") or 0)
-            tokens = int(m.get("total_tokens") or 0)
-            req = int(m.get("request_count") or 0)
+            cost = self._num(m.get("total_cost"))
+            tokens = int(self._num(m.get("total_tokens")))
+            req = int(self._num(m.get("request_count")))
             share = (cost / total_cost * 100) if total_cost else 0.0
             bar = (cost / max_cost * 100) if max_cost else 0.0
 
@@ -512,6 +526,10 @@ class CostReportPlugin(MaiBotPlugin):
                 """
             )
 
+        # 宿主按调用次数取前 50 个模型，真撞到上限时说明一句，
+        # 免得用户以为卡片上的总额就是全部花费。
+        capped_note = "，按调用次数取前 50 个模型汇总" if len(models) >= 50 else ""
+
         cache_block = ""
         if denom > 0:
             cache_block = f"""
@@ -527,7 +545,7 @@ class CostReportPlugin(MaiBotPlugin):
             <div class="stat">
               <div class="k">缓存命中</div>
               <div class="v muted">—</div>
-              <div class="d">读不到 llm_usage，检查「数据库路径」配置</div>
+              <div class="d">窗口内没有缓存数据，或读不到 llm_usage</div>
             </div>
             """
 
@@ -601,7 +619,7 @@ class CostReportPlugin(MaiBotPlugin):
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
-    <div class="foot">数据来自 statistics_model_hourly 聚合表{cache_stats and '，缓存命中率取自 llm_usage 明细' or ''}</div>
+    <div class="foot">数据来自 statistics_model_hourly 聚合表{capped_note}{cache_stats and '，缓存命中率取自 llm_usage 明细' or ''}</div>
   </div>
 </body></html>"""
 
@@ -616,9 +634,13 @@ class CostReportPlugin(MaiBotPlugin):
         """
         override = str(self.config.report.db_path or "").strip()
         if override:
-            return Path(override)
+            # resolve() 是为了 as_uri()：相对路径表达不成 file URI
+            try:
+                return Path(override).expanduser().resolve()
+            except Exception:
+                return None
         try:
-            return Path(self.ctx.paths.data_dir).parent.parent / "MaiBot.db"
+            return (Path(self.ctx.paths.data_dir).parent.parent / "MaiBot.db").resolve()
         except Exception:
             return None
 
@@ -632,7 +654,13 @@ class CostReportPlugin(MaiBotPlugin):
             )
             return {}
 
-        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        # 对齐到下一个整点：聚合表按整点分桶，`bucket_time >= since` 取到的第一个
+        # 桶是 ceil(since)，所以明细查询也必须从 ceil(since) 起，两边才是同一个窗口。
+        # 不然卡片上的「花费」和「缓存命中」会差最多 59 分钟的数据。
+        start = (datetime.now() - timedelta(days=days)).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(hours=1)
+        since = start.strftime("%Y-%m-%d %H:%M:%S")
         # 用 model_assign_name 分组：它才是配置里的模型名（`wb-proxy/deepseek-v4.1-flash`），
         # 和 statistics_model_hourly.model_name 对得上。llm_usage.model_name 存的是
         # model_identifier（`deepseek-v4.1-flash`），直接拿它对不上。
@@ -645,8 +673,9 @@ class CostReportPlugin(MaiBotPlugin):
             GROUP BY model
         """
         try:
-            # 只读连接 + busy_timeout，避免和正在跑的 MaiBot 抢锁
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+            # 只读连接 + busy_timeout，避免和正在跑的 MaiBot 抢锁。
+            # 用 as_uri() 而不是拼 f"file:{path}"：路径里带空格或 # 时后者会解析错。
+            con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=5)
             try:
                 rows = con.execute(sql, (since,)).fetchall()
             finally:
@@ -679,23 +708,20 @@ class CostReportPlugin(MaiBotPlugin):
         if not models:
             return f"{label}还没有模型调用记录。"
 
-        total_cost = sum(float(m.get("total_cost") or 0) for m in models)
-        total_tokens = sum(int(m.get("total_tokens") or 0) for m in models)
-        total_req = sum(int(m.get("request_count") or 0) for m in models)
+        total_cost, total_tokens, total_req = self._totals(models)
 
         head = (
             f"{label}：花费 {total_cost:.2f}{unit}，{total_tokens:,} token，"
             f"{total_req} 次调用"
         )
-        hit = sum(v["hit"] for v in cache_stats.values())
-        miss = sum(v["miss"] for v in cache_stats.values())
+        hit, miss = self._hit_miss(cache_stats)
         if hit + miss:
             head += f"，缓存命中 {hit / (hit + miss) * 100:.1f}%"
 
-        ranked = sorted(models, key=lambda m: -float(m.get("total_cost") or 0))[:3]
+        ranked = sorted(models, key=lambda m: -self._num(m.get("total_cost")))[:3]
         items = [
             f"{str(m.get('model_name') or 'Unknown')} "
-            f"{float(m.get('total_cost') or 0):.2f}{unit}"
+            f"{self._num(m.get('total_cost')):.2f}{unit}"
             for m in ranked
         ]
         return f"{head}。\n花钱最多：{'、'.join(items)}。"
@@ -714,9 +740,7 @@ class CostReportPlugin(MaiBotPlugin):
             label = "最近 24 小时" if days == 1 else f"最近 {days} 天"
             return f"{label}还没有模型调用记录。"
 
-        total_cost = sum(float(m.get("total_cost") or 0) for m in models)
-        total_tokens = sum(int(m.get("total_tokens") or 0) for m in models)
-        total_req = sum(int(m.get("request_count") or 0) for m in models)
+        total_cost, total_tokens, total_req = self._totals(models)
         avg_cost = total_cost / total_req if total_req else 0.0
 
         label = "最近 24 小时" if days == 1 else f"最近 {days} 天"
@@ -729,8 +753,7 @@ class CostReportPlugin(MaiBotPlugin):
 
         # 缓存命中：命中部分按缓存价计费，直接影响实际花费
         if cache_stats:
-            hit_sum = sum(v["hit"] for v in cache_stats.values())
-            miss_sum = sum(v["miss"] for v in cache_stats.values())
+            hit_sum, miss_sum = self._hit_miss(cache_stats)
             denom = hit_sum + miss_sum
             if denom > 0:
                 rate = hit_sum / denom * 100
@@ -740,14 +763,17 @@ class CostReportPlugin(MaiBotPlugin):
 
         lines.extend(["", "按模型（花费降序）："])
 
-        ranked = sorted(models, key=lambda m: -float(m.get("total_cost") or 0))
+        ranked = sorted(models, key=lambda m: -self._num(m.get("total_cost")))
         for m in ranked[: cfg.top_models]:
             name = str(m.get("model_name") or "Unknown")
-            cost = float(m.get("total_cost") or 0)
-            tokens = int(m.get("total_tokens") or 0)
-            req = int(m.get("request_count") or 0)
+            cost = self._num(m.get("total_cost"))
+            tokens = int(self._num(m.get("total_tokens")))
+            req = int(self._num(m.get("request_count")))
             share = (cost / total_cost * 100) if total_cost else 0.0
-            row = f"  {name[:24]:<26} {cost:>7.2f}{unit} {tokens:>11,} tok {req:>5}次 {share:>5.1f}%"
+            row = (
+                f"  {self._pad(name[:24], 26)} {cost:>7.2f}{unit} "
+                f"{tokens:>11,} tok {req:>5}次 {share:>5.1f}%"
+            )
             stats = cache_stats.get(name)
             if stats:
                 denom = stats["hit"] + stats["miss"]
@@ -757,7 +783,7 @@ class CostReportPlugin(MaiBotPlugin):
 
         if len(ranked) > cfg.top_models:
             rest = ranked[cfg.top_models :]
-            rest_cost = sum(float(m.get("total_cost") or 0) for m in rest)
+            rest_cost = sum(self._num(m.get("total_cost")) for m in rest)
             lines.append(f"  另外 {len(rest)} 个模型合计 {rest_cost:.2f}{unit}")
 
         return "\n".join(lines)
